@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+
+import sys
+import argparse
+import email
+import email.header
+import quopri
+from email.message import Message
+
+from typing import Dict, Union, Type, TypeVar, List, Callable
+
+import contextlib
+
+textTypes = ["text/plain", "text/html"]
+imageTypes = ["image/gif", "image/jpeg", "image/png"]
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+
+def custom_sort(
+    list_of_items: List[T],
+    preferences: List[U],
+    functor_item_to_val: Callable[[T], U] = lambda x: x,
+):
+    # Create a dictionary to store indices of preferences (if available)
+    index_map = {val: i for i, val in enumerate(preferences) if val in preferences}
+
+    # Sort the list_of_items based on their indices if available in preferences list,
+    # otherwise, use a value greater than the length of preferences list
+    sorted_strings = sorted(
+        list_of_items,
+        key=lambda x: index_map.get(functor_item_to_val(x), len(preferences)),
+    )
+
+    return sorted_strings
+
+
+class NoExceptionContext:
+    """
+    Anything inside here will has no exception
+    """
+
+    def __init__(self, excep_type: Type[Exception] = Exception):
+        self.excep_type: Type[Exception] = excep_type
+        self.__cm = None
+
+    @contextlib.contextmanager
+    def contextmanager(self):
+        try:
+            yield
+        except self.excep_type:
+            pass
+
+    def __enter__(self):
+        self.__cm = self.contextmanager()
+        return self.__cm.__enter__()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self.__cm.__exit__(exc_type, exc_value, traceback)
+
+
+def html_sanitise(text: Union[str, bytes]) -> str:
+    if type(text) == bytes:
+        text = text.decode()
+    return text.replace("<", "&lt;").replace(">", "&gt;")
+
+
+def header_decode(header) -> str:
+    hdr = ""
+    for text, encoding in email.header.decode_header(header):
+        if isinstance(text, bytes):
+            text = text.decode(encoding or "us-ascii")
+        hdr += text
+    return hdr
+
+
+def extract_message_as_html_str(message: Message, show_header: bool = True):
+    html_parts = []
+    attachments = []
+    _extract_message_as_html_str(message, html_parts, attachments)
+
+    html_string = "".join(html_parts)
+    if show_header:
+        datapack = extract_datapack(message)
+        header = datapack_to_pretty_header(datapack, attachments)
+        html_string = header + html_string
+
+    return html_string
+
+
+def _extract_message_as_html_str(
+    message: Message,
+    html_parts: List[str],
+    attachments: List[str] = [],
+) -> str:
+    # if message.
+    mimeType = message.get_content_type()
+
+    if message.is_multipart():
+        payload = message.get_payload()
+
+        if mimeType == "multipart/alternative":
+            # try to select based on preferences:
+            for part in custom_sort(
+                payload,
+                # preferences=["text/plain"],
+                preferences=["text/html", "text/plain"],
+                functor_item_to_val=lambda x: x.get_content_type(),
+            ):
+                with NoExceptionContext():
+                    _extract_message_as_html_str(part, html_parts, attachments)
+                    return
+        else:
+            # e.g., multipart/mixed
+            for part in payload:
+                _extract_message_as_html_str(part, html_parts, attachments)
+
+    ################################
+    content_disposition = message.get_content_disposition()
+    if content_disposition:
+        content_disposition = content_disposition.lower()
+
+    if content_disposition == "attachment":
+        fileName = message.get_filename()
+        if not fileName:
+            fileName = "Unknown"
+        attachments.append(f"<code>{fileName}</code> ({mimeType})")
+
+    elif mimeType in textTypes:
+        payload = quopri.decodestring(message.get_payload(decode=True)).decode(
+            "utf-8", errors="ignore"
+        )
+
+        if mimeType == "text/plain":
+            # Cleanup dirty characters
+            for char in ["\n", "\\n"]:
+                payload = payload.replace(char, "<br>")
+            for char in ["\t", "\\t"]:
+                payload = payload.replace(char, " ")
+            for char in ["\r", "\\r"]:
+                payload = payload.replace(char, "")
+
+        html_parts.append(payload)
+    elif mimeType in imageTypes:
+        # html_parts.append("[some image]")
+        html_parts.append("<p>[some image here]<p>")
+        pass
+
+    # if isinstance(payload, str):
+    #     payload_decoded: bytes = message.get_payload(decode=True)
+    #     payload_decoded_str: str = payload_decoded.decode("utf-8", errors="ignore")
+    #     return payload_decoded_str
+    # elif message.is_multipart():
+    #     return "\n".join(
+    #         [
+    #             _extract_message_as_html_str(message)
+    #             for message in payload
+    #             if message.get_content_type() == "text/html"
+    #         ]
+    #     )
+    # else:
+    #     return "[failed to parse message]"
+    #     # raise ValueError(f"`payload` type is {type(payload)}")
+
+
+def extract_datapack(msg: Message) -> Dict:
+    datapack = dict()
+
+    with NoExceptionContext():
+        datapack["date"] = header_decode(msg["Date"])
+    with NoExceptionContext():
+        datapack["from"] = header_decode(msg["From"])
+    with NoExceptionContext():
+        datapack["to"] = header_decode(msg["To"])
+    with NoExceptionContext():
+        datapack["subject"] = header_decode(msg["Subject"])
+    with NoExceptionContext():
+        datapack["id"] = header_decode(msg["Message-Id"])
+
+    return datapack
+
+
+def datapack_to_pretty_header(datapack: Dict, attachments: List[str]) -> str:
+    footer = ""
+    if len(attachments):
+        footer = "<hr><b>Attached Files:</b><ul>"
+        for a in attachments:
+            footer = footer + "<li>" + a + "</li>"
+        footer += "</ul>"
+
+    unknown = "&lt;Unknown&gt;"
+    # Build a first image with basic mail details
+    return f"""
+    <table width="100%">
+      <tr><td align="right"><b>Date:</b></td><td>{datapack.get('date', unknown)}</td></tr>
+      <tr><td align="right"><b>From:</b></td><td>{html_sanitise(datapack.get('from', unknown))}</td></tr>
+      <tr><td align="right"><b>To:</b></td><td>{html_sanitise(datapack.get('to', unknown))}</td></tr>
+      <tr><td align="right"><b>Subject:</b></td><td>{html_sanitise(datapack.get('subject', unknown))}</td></tr>
+      <tr><td align="right"><b>Message-Id:</b></td><td>{html_sanitise(datapack.get('id', unknown))}</td></tr>
+    </table>
+    {footer}
+    <hr>
+    """
+
+
+parser = argparse.ArgumentParser("eml2html")
+parser.add_argument("input_file", type=argparse.FileType("rb"), nargs="?", default="-")
+parser.add_argument("output_file", type=str, nargs="?", default="-")
+parser.add_argument(
+    "--no-header", action="store_false", help="turn off rendering email header"
+)
+
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+
+    if args.input_file == "-":
+        # change to file descriptor
+        args.output_file = 0
+    if args.output_file == "-":
+        # change to file descriptor
+        args.output_file = 1
+
+    html_data = extract_message_as_html_str(
+        email.message_from_bytes(args.input_file.read()), show_header=not args.no_header
+    )
+
+    with open(args.output_file, "w") as f:
+        # file_content_bytes = f.read()
+        f.write(html_data)
